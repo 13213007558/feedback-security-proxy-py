@@ -21,7 +21,7 @@ import socket
 import logging
 import threading
 import subprocess
-from typing import Any, Dict, List, Union, Optional
+from typing import Any, Dict, List, Tuple, Union, Optional
 
 from .plugin import HttpProxyBasePlugin
 from ..parser import HttpParser, httpParserTypes, httpParserStates
@@ -32,6 +32,9 @@ from ..exception import HttpProtocolException, ProxyConnectionFailed
 from ..protocols import httpProtocols
 from ..responses import PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT
 from ...common.pki import gen_csr, sign_csr, gen_public_key
+from ...common.cert_cache import (
+    CertificateCache, CertificateGenerationError, LeafPaths,
+)
 from ...core.event import eventNames
 from ...common.flag import flags
 from ...common.types import Readables, Writables, Descriptors
@@ -129,6 +132,17 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
     # Used to synchronization during certificate generation and
     # connection pool operations.
     lock = threading.Lock()
+
+    # Process-wide validated certificate cache, keyed by the configured
+    # (ca_cert_file, ca_key_file, ca_signing_key_file) identity.  Replaced
+    # atomically when the interception CA / signing material is rotated.
+    _cert_cache_instance: Optional[
+        Tuple[Tuple[str, str, str], CertificateCache]
+    ] = None
+
+    # Serializes construction / rotation of the process-wide cache so that
+    # concurrent handshakes cannot each build a competing cache instance.
+    _cert_cache_lock = threading.Lock()
 
     def __init__(
             self,
@@ -635,25 +649,27 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
     #
 
     def gen_ca_signed_certificate(
-            self, cert_file_path: str, certificate: Dict[str, Any],
+            self,
+            host: str,
+            certificate: Dict[str, Any],
+            paths: LeafPaths,
     ) -> None:
         '''CA signing key (default) is used for generating a public key
         for common_name, if one already doesn't exist.  Using generated
         public key a CSR request is generated, which is then signed by
-        CA key and secret.  Again this process only happen if signed
-        certificate doesn't already exist.
+        CA key and secret.
 
-        returns signed certificate path.'''
+        All material is written to the temp paths carried by ``paths``.
+        The :class:`~proxy.common.cert_cache.CertificateCache` validates
+        and atomically publishes them; this method never writes the final
+        cache paths directly.'''
         assert(
-            self.request.host and self.flags.ca_cert_dir and self.flags.ca_signing_key_file and
+            self.flags.ca_cert_dir and self.flags.ca_signing_key_file and
             self.flags.ca_key_file and self.flags.ca_cert_file
         )
 
         upstream_subject = {s[0][0]: s[0][1] for s in certificate['subject']}
-        public_key_path = os.path.join(
-            self.flags.ca_cert_dir,
-            '{0}.{1}'.format(text_(self.request.host), 'pub'),
-        )
+        public_key_path = paths.pub
         private_key_path = self.flags.ca_signing_key_file
         private_key_password = ''
 
@@ -673,35 +689,30 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
                     key,
                     upstream_subject.get(keys[key]),
                 )
-        alt_subj_names = [text_(self.request.host)]
+        alt_subj_names = [host]
         validity_in_days = 365 * 2
         timeout = 10
 
         # Generate a public key for the common name
-        if not os.path.isfile(public_key_path):
-            logger.debug('Generating public key %s', public_key_path)
-            resp = gen_public_key(
-                public_key_path=public_key_path, private_key_path=private_key_path,
-                private_key_password=private_key_password, subject=subject, alt_subj_names=alt_subj_names,
-                validity_in_days=validity_in_days, timeout=timeout,
-                openssl=self.flags.openssl,
-            )
-            assert(resp is True)
-
-        csr_path = os.path.join(
-            self.flags.ca_cert_dir,
-            '{0}.{1}'.format(text_(self.request.host), 'csr'),
+        logger.debug('Generating public key %s', public_key_path)
+        resp = gen_public_key(
+            public_key_path=public_key_path, private_key_path=private_key_path,
+            private_key_password=private_key_password, subject=subject, alt_subj_names=alt_subj_names,
+            validity_in_days=validity_in_days, timeout=timeout,
+            openssl=self.flags.openssl,
         )
+        assert(resp is True)
+
+        csr_path = paths.csr
 
         # Generate a CSR request for this common name
-        if not os.path.isfile(csr_path):
-            logger.debug('Generating CSR %s', csr_path)
-            resp = gen_csr(
-                csr_path=csr_path, key_path=private_key_path, password=private_key_password,
-                crt_path=public_key_path, timeout=timeout,
-                openssl=self.flags.openssl,
-            )
-            assert(resp is True)
+        logger.debug('Generating CSR %s', csr_path)
+        resp = gen_csr(
+            csr_path=csr_path, key_path=private_key_path, password=private_key_password,
+            crt_path=public_key_path, timeout=timeout,
+            openssl=self.flags.openssl,
+        )
+        assert(resp is True)
 
         ca_key_path = self.flags.ca_key_file
         ca_key_password = ''
@@ -709,16 +720,15 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
         serial = '%d%d' % (time.time(), os.getpid())
 
         # Sign generated CSR
-        if not os.path.isfile(cert_file_path):
-            logger.debug('Signing CSR %s', cert_file_path)
-            resp = sign_csr(
-                csr_path=csr_path, crt_path=cert_file_path, ca_key_path=ca_key_path,
-                ca_key_password=ca_key_password, ca_crt_path=ca_crt_path,
-                serial=str(serial), alt_subj_names=alt_subj_names,
-                validity_in_days=validity_in_days, timeout=timeout,
-                openssl=self.flags.openssl,
-            )
-            assert(resp is True)
+        logger.debug('Signing CSR %s', paths.pem)
+        resp = sign_csr(
+            csr_path=csr_path, crt_path=paths.pem, ca_key_path=ca_key_path,
+            ca_key_password=ca_key_password, ca_crt_path=ca_crt_path,
+            serial=str(serial), alt_subj_names=alt_subj_names,
+            validity_in_days=validity_in_days, timeout=timeout,
+            openssl=self.flags.openssl,
+        )
+        assert(resp is True)
 
     @staticmethod
     def generated_cert_file_path(ca_cert_dir: str, host: str) -> str:
@@ -737,13 +747,46 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
                 f'--ca-key-file:{ self.flags.ca_key_file}, '
                 f'--ca-signing-key-file:{ self.flags.ca_signing_key_file}',
             )
-        cert_file_path = HttpProxyPlugin.generated_cert_file_path(
-            self.flags.ca_cert_dir, text_(self.request.host),
+        host = text_(self.request.host)
+        cache = self._certificate_cache()
+        # Surface mismatched CA / signing material once per process so the
+        # operations team can see why cached certificates are re-signed.
+        cache.log_audit()
+        return cache.get(host, certificate)
+
+    def _certificate_cache(self) -> CertificateCache:
+        '''Return the process-wide cache for the currently configured CA.
+
+        A new cache instance is built whenever the configured CA / signing
+        material changes, so entries from a previous interception CA are
+        validated against the new identity instead of being blindly reused.
+        '''
+        identity = (
+            self.flags.ca_cert_file,
+            self.flags.ca_key_file,
+            self.flags.ca_signing_key_file,
         )
-        with self.lock:
-            if not os.path.isfile(cert_file_path):
-                self.gen_ca_signed_certificate(cert_file_path, certificate)
-        return cert_file_path
+        current = HttpProxyPlugin._cert_cache_instance
+        if current is not None and current[0] == identity:
+            return current[1]
+        with HttpProxyPlugin._cert_cache_lock:
+            # Re-check under the lock: another handshake may have rotated
+            # the cache while we were waiting.
+            current = HttpProxyPlugin._cert_cache_instance
+            if current is not None and current[0] == identity:
+                return current[1]
+            cache = CertificateCache(
+                cache_dir=self.flags.ca_cert_dir,
+                ca_cert_file=self.flags.ca_cert_file,
+                ca_key_file=self.flags.ca_key_file,
+                signing_key_file=self.flags.ca_signing_key_file,
+                generator=lambda host, cert, paths: self.gen_ca_signed_certificate(
+                    host, cert, paths,
+                ),
+                openssl=self.flags.openssl,
+            )
+            HttpProxyPlugin._cert_cache_instance = (identity, cache)
+            return cache
 
     def intercept(self) -> Union[socket.socket, bool]:
         # Perform SSL/TLS handshake with upstream
@@ -861,6 +904,13 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
             logger.warning(
                 'BrokenPipeError when wrapping client for upstream: {0}'.format(
                     self.upstream.addr[0],
+                ),
+            )
+            do_close = True
+        except CertificateGenerationError as e:
+            logger.warning(
+                'Certificate generation failed for upstream {0}: {1}'.format(
+                    self.upstream.addr[0], str(e),
                 ),
             )
             do_close = True

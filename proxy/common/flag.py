@@ -411,6 +411,10 @@ class FlagParser:
 
         # FIXME: Necessary here until flags framework provides a way
         # for flag owners to initialize
+        args.cache_dir = cast(
+            str,
+            opts.get('cache_dir', args.cache_dir),
+        )
         os.makedirs(args.cache_dir, exist_ok=True)
         os.makedirs(os.path.join(args.cache_dir, 'responses'), exist_ok=True)
         os.makedirs(os.path.join(args.cache_dir, 'content'), exist_ok=True)

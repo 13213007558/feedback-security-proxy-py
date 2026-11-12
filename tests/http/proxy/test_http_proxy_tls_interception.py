@@ -11,6 +11,7 @@
 import ssl
 import uuid
 import socket
+import tempfile
 import selectors
 from typing import Any, TypeVar
 
@@ -42,17 +43,24 @@ class TestHttpProxyTlsInterception(Assertions):
 
         self.mock_socket_dup = mocker.patch('socket.dup')
         self.mock_selector = mocker.patch('selectors.DefaultSelector')
-        self.mock_sign_csr = mocker.patch('proxy.http.proxy.server.sign_csr')
-        self.mock_gen_csr = mocker.patch('proxy.http.proxy.server.gen_csr')
-        self.mock_gen_public_key = mocker.patch(
-            'proxy.http.proxy.server.gen_public_key',
+        # Certificate generation and validation are owned by the
+        # CertificateCache; here we only assert the plugin asks the cache
+        # for the host's leaf certificate path.
+        self.mock_cert_cache_cls = mocker.patch(
+            'proxy.http.proxy.server.CertificateCache',
         )
+        self.mock_cert_cache = self.mock_cert_cache_cls.return_value
+        self._mock_cert_dir = tempfile.mkdtemp(prefix='proxy-mock-certs-')
+        self.mock_cert_cache.get.side_effect = \
+            lambda host, cert: HttpProxyPlugin.generated_cert_file_path(
+                self._mock_cert_dir, host,
+            )
+        self.mock_cert_cache.configuration_warnings = []
+        # Avoid leaking a cache instance built by another test module.
+        HttpProxyPlugin._cert_cache_instance = None
         self.mock_server_conn = mocker.patch(
             'proxy.http.proxy.server.TcpServerConnection',
         )
-        self.mock_sign_csr.return_value = True
-        self.mock_gen_csr.return_value = True
-        self.mock_gen_public_key.return_value = True
 
         self.fileno = 10
         self.mock_socket_dup.side_effect = lambda fd: fd
@@ -88,10 +96,14 @@ class TestHttpProxyTlsInterception(Assertions):
             mock.PropertyMock(return_value=False)
 
         self._addr = ('127.0.0.1', 54382)
+        self._data_dir = tempfile.mkdtemp(prefix='proxy-data-')
+        self._cache_dir = tempfile.mkdtemp(prefix='proxy-cache-')
         self.flags = FlagParser.initialize(
             ca_cert_file='ca-cert.pem',
             ca_key_file='ca-key.pem',
             ca_signing_key_file='ca-signing-key.pem',
+            data_dir=self._data_dir,
+            cache_dir=self._cache_dir,
             threaded=True,
         )
         self.assertTrue(tls_interception_enabled(self.flags))
@@ -240,9 +252,14 @@ class TestHttpProxyTlsInterception(Assertions):
         self.mock_ssl_context.return_value.wrap_socket.assert_called_with(
             plain_connection, server_hostname=host,
         )
-        self.assertEqual(self.mock_sign_csr.call_count, 1)
-        self.assertEqual(self.mock_gen_csr.call_count, 1)
-        self.assertEqual(self.mock_gen_public_key.call_count, 1)
+        # The validated cache is consulted exactly once for this host and
+        # the returned leaf path is what gets loaded into the SSL context.
+        self.assertEqual(self.mock_cert_cache.get.call_count, 1)
+        self.assertEqual(
+            self.mock_cert_cache.get.call_args[0][0],
+            host,
+        )
+        self.mock_cert_cache.log_audit.assert_called()
         self.assertEqual(upstream_tls_sock.setblocking.call_count, 1)
         self.assertEqual(
             self.mock_server_conn.return_value._conn,
@@ -258,7 +275,7 @@ class TestHttpProxyTlsInterception(Assertions):
         self.mock_ssl_wrap.return_value.load_cert_chain(
             keyfile=self.flags.ca_signing_key_file,
             certfile=HttpProxyPlugin.generated_cert_file_path(
-                self.flags.ca_cert_dir,
+                self._mock_cert_dir,
                 host,
             ),
         )
