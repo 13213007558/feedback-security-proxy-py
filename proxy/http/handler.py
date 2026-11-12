@@ -51,6 +51,9 @@ class HttpProtocolHandler(BaseTcpServerHandler[HttpClientConnection]):
         self.plugin: Optional[HttpProtocolHandlerPlugin] = None
         self.writes_teared: bool = False
         self.reads_teared: bool = False
+        # Number of bytes peeked from the client socket while parsing
+        # the first request.  None when peeking is not in use.
+        self._first_request_peek_size: Optional[int] = None
 
     ##
     # initialize, is_inactive, shutdown, get_events, handle_events
@@ -221,6 +224,9 @@ class HttpProtocolHandler(BaseTcpServerHandler[HttpClientConnection]):
         if self.work.connection.fileno() in readables:
             logger.debug('Client is read ready, receiving...')
             self.last_activity = time.time()
+            if self.request.state != httpParserStates.COMPLETE and \
+                    self._can_peek():
+                return self._peek_first_request()
             try:
                 teardown = await super().handle_readables(readables)
                 if teardown:
@@ -272,6 +278,72 @@ class HttpProtocolHandler(BaseTcpServerHandler[HttpClientConnection]):
                     return k
         return None
 
+    def _can_peek(self) -> bool:
+        """Returns true when incoming client data can be peeked into
+        without consuming it from the socket buffer."""
+        conn = self.work.connection
+        return isinstance(conn, socket.socket) and \
+            not isinstance(conn, ssl.SSLSocket)
+
+    def _peek_first_request(self) -> bool:
+        """Peeks at incoming data until the first request has been parsed.
+
+        Only bytes belonging to the request are consumed from the socket
+        buffer.  Bytes following the request (e.g. a TLS ClientHello
+        coalesced with a CONNECT request) are left within the socket
+        buffer, so that they can be picked up by the tunnel, the TLS
+        interception handshake, or simply dropped upon teardown."""
+        try:
+            data = self.work.connection.recv(
+                self.flags.client_recvbuf_size, socket.MSG_PEEK,
+            )
+        except BlockingIOError:     # Try again later
+            return False
+        except socket.error as e:
+            if e.errno == errno.ECONNRESET:
+                logger.debug('%r' % e)
+            else:
+                logger.warning(
+                    'Exception when receiving from %s connection#%d with reason %r' %
+                    (self.work.tag, self.work.connection.fileno(), e),
+                    exc_info=True,
+                )
+            return True
+        if not data:
+            logger.debug('Client closed connection, tearing down...')
+            self.work.closed = True
+            return True
+        offset = self._first_request_peek_size or 0
+        new = data[offset:]
+        if not new:
+            return False
+        self._first_request_peek_size = offset + len(new)
+        teardown = self.handle_data(memoryview(new))
+        if isinstance(teardown, bool) and teardown is True:
+            if self.work.has_buffer():
+                self.must_flush_before_shutdown = True
+            else:
+                return True
+        return False
+
+    def _consume_peeked_request_bytes(self) -> None:
+        """Consumes exactly the parsed request bytes from the socket.
+
+        Any bytes beyond the request (held back within
+        ``self.request.buffer``) are left within the socket buffer for
+        subsequent consumers i.e. the tunnel, the TLS interception
+        handshake, or simply dropped when the connection is torn down."""
+        if self._first_request_peek_size is None:
+            return
+        leftover = len(self.request.buffer) if self.request.buffer else 0
+        used = self._first_request_peek_size - leftover
+        self._first_request_peek_size = None
+        # Discard the parser's own copy of leftover bytes, they are
+        # still pending within the socket buffer and will be re-read.
+        self.request.buffer = None
+        if used > 0:
+            self.work.connection.recv(used)
+
     def _parse_first_request(self, data: memoryview) -> bool:
         # Parse http request
         try:
@@ -286,6 +358,12 @@ class HttpProtocolHandler(BaseTcpServerHandler[HttpClientConnection]):
             ) from e
         if not self.request.is_complete:
             return False
+        # When peeking, consume exactly the bytes belonging to this
+        # request from the socket before any plugin logic runs.  This
+        # must happen before plugin.on_request_complete, because e.g.
+        # the TLS interception handshake expects a coalesced ClientHello
+        # (and not the CONNECT headers) at the head of the socket buffer.
+        self._consume_peeked_request_bytes()
         # Bail out if http protocol is unknown
         if self.request.http_handler_protocol == httpProtocols.UNKNOWN:
             self.work.queue(BAD_REQUEST_RESPONSE_PKT)
@@ -304,6 +382,15 @@ class HttpProtocolHandler(BaseTcpServerHandler[HttpClientConnection]):
         # Invoke plugin.on_request_complete
         output = self.plugin.on_request_complete()
         if isinstance(output, bool):
+            if output is False and self.request.buffer:
+                # When peeking is not possible (e.g. TLS wrapped client
+                # connections), bytes coalesced with the request are held
+                # back within the parser buffer.  Deliver them to the
+                # plugin exactly once, so that e.g. a TLS ClientHello
+                # coalesced with a CONNECT request is neither lost nor
+                # parsed as another HTTP request.
+                leftover, self.request.buffer = self.request.buffer, None
+                self.plugin.on_client_data(leftover)
             return output
         assert isinstance(output, ssl.SSLSocket)
         logger.debug(

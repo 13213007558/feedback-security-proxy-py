@@ -277,9 +277,14 @@ class HttpParser:
                 self.state = httpParserStates.COMPLETE
             # Mark request as complete if headers received and no incoming
             # body indication received.
+            #
+            # CONNECT tunnel requests are complete as soon as their headers
+            # have been received.  Any bytes following the headers (e.g. a
+            # TLS ClientHello coalesced within the same packet) belong to
+            # the tunnel and must be left within the parser buffer.
             elif self.state == httpParserStates.HEADERS_COMPLETE and \
                     not (self._content_expected or self._is_chunked_encoded) and \
-                    raw == b'':
+                    (raw == b'' or self._is_https_tunnel):
                 self.state = httpParserStates.COMPLETE
         self.buffer = None if raw == b'' else raw
 

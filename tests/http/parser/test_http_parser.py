@@ -70,6 +70,46 @@ class TestHttpParser(unittest.TestCase):
         self.assertEqual(self.parser.port, 443)
         self.assertNotEqual(self.parser.state, httpParserStates.COMPLETE)
 
+    def test_connect_request_with_coalesced_tls_client_hello(self) -> None:
+        # A TLS ClientHello coalesced with the CONNECT headers within
+        # the same packet must not be consumed as request body.  The
+        # request is complete once headers have been received and the
+        # ClientHello must be left within the parser buffer.
+        client_hello = b'\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03' + \
+            bytes(range(256)) * 2
+        self.parser.parse(memoryview(
+            b'CONNECT pypi.org:443 HTTP/1.1\r\n'
+            b'Host: pypi.org:443\r\n'
+            b'User-Agent: test\r\n\r\n' + client_hello,
+        ))
+        self.assertEqual(self.parser.state, httpParserStates.COMPLETE)
+        self.assertIsNone(self.parser.body)
+        self.assertIsNotNone(self.parser.buffer)
+        assert self.parser.buffer is not None
+        self.assertEqual(self.parser.buffer.tobytes(), client_hello)
+
+    def test_connect_request_with_coalesced_data_fragmented(self) -> None:
+        # Same as above, but bytes trickle in arbitrarily fragmented.
+        client_hello = b'\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03' + \
+            bytes(range(256)) * 2
+        pkt = b'CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org:443\r\n\r\n' + \
+            client_hello
+        for index in range(len(pkt)):
+            self.parser.parse(memoryview(pkt[index:index + 1]))
+        self.assertEqual(self.parser.state, httpParserStates.COMPLETE)
+        self.assertIsNone(self.parser.body)
+        self.assertIsNotNone(self.parser.buffer)
+        assert self.parser.buffer is not None
+        self.assertEqual(self.parser.buffer.tobytes(), client_hello)
+
+    def test_connect_request_without_trailing_data_has_empty_buffer(self) -> None:
+        self.parser.parse(memoryview(
+            b'CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org:443\r\n\r\n',
+        ))
+        self.assertEqual(self.parser.state, httpParserStates.COMPLETE)
+        self.assertIsNone(self.parser.body)
+        self.assertIsNone(self.parser.buffer)
+
     def test_urlparse_on_invalid_connect_request(self) -> None:
         self.parser.parse(memoryview(b'CONNECT / HTTP/1.0\r\n\r\n'))
         self.assertTrue(self.parser.is_https_tunnel)
