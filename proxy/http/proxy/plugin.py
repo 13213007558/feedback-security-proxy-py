@@ -80,8 +80,60 @@ class HttpProxyBasePlugin(
         Return optionally modified request object.
         If None is returned, upstream connection won't be established.
 
-        Raise HttpRequestRejected or HttpProtocolException directly to drop the connection."""
+        Raise HttpRequestRejected or HttpProtocolException directly to drop the connection.
+
+        Routing security contract:
+
+        - This hook runs *before* any upstream socket is opened.  Rejecting
+          here therefore never establishes a connection.
+        - Plugins MAY rewrite the request destination (``request.host`` /
+          ``request.port``, e.g. via ``request.set_url``) from this hook.  The
+          core re-runs :meth:`authorize_route` afterwards, so the rewritten
+          destination is admitted before a connection is made.
+        - Do NOT rely on this hook alone for destination based access control.
+          A later plugin can still rewrite the destination, so authorization
+          policies must be implemented in :meth:`authorize_route`, which is
+          always evaluated against the final, actually connected host:port.
+        """
         return request  # pragma: no cover
+
+    # Since 3.4.0
+    #
+    # @abstractmethod
+    def authorize_route(
+            self, request: HttpParser,
+    ) -> Optional[bool]:
+        """Final route admission hook.
+
+        Called by the core after all :meth:`before_upstream_connection` and
+        :meth:`handle_client_request` plugins have run, immediately before the
+        request is dispatched on its upstream connection.  It is invoked for
+        both plain HTTP proxy requests and ``CONNECT`` (HTTPS tunnel) requests,
+        and again for every pipelined request on an already established
+        upstream connection.
+
+        ``request.host`` and ``request.port`` at this point describe the exact
+        destination the proxy will connect (or has connected) to.  Implement
+        destination based allow/deny policies here instead of in
+        :meth:`before_upstream_connection`, so authorization can never be
+        bypassed by plugin ordering or by another plugin rewriting the route.
+
+        Return:
+
+        - ``True`` (default) to admit the route.
+        - ``False`` or raise :class:`~proxy.http.exception.HttpRequestRejected`
+          (or :class:`~proxy.http.exception.RouteAuthorizationRejected`) to
+          reject it.  No upstream connection is established when a rejection
+          happens before connect.
+
+        The core invokes every plugin's ``authorize_route`` and rejects the
+        request if any single plugin rejects it.  If a plugin changes the
+        destination after admission, the core re-runs this hook against the new
+        destination; when the destination of an already established connection
+        is changed, the request is instead rejected outright because the open
+        connection cannot be repurposed for a different host:port.
+        """
+        return True  # pragma: no cover
 
     # Since 3.4.0
     #
@@ -99,6 +151,15 @@ class HttpProxyBasePlugin(
 
         Raise HttpRequestRejected to tear down the connection
         Return None to drop the connection
+
+        Short-circuit contract: when a plugin takes over the request without an
+        upstream connection (returns None from
+        :meth:`before_upstream_connection`), it owns the full client exchange.
+        Route admission is still performed before this hook is used, hence any
+        response queued directly to the client here has already been authorized
+        against the requested destination.  Such a plugin MUST NOT open its own
+        network connection to a destination that
+        :meth:`authorize_route` would not admit.
         """
         return raw  # pragma: no cover
 
@@ -121,6 +182,24 @@ class HttpProxyBasePlugin(
         Return None to drop the request data, e.g. in case a response has already been queued.
         Raise HttpRequestRejected or HttpProtocolException directly to
         tear down the connection with client.
+
+        Routing security contract:
+
+        - On the first request this hook runs AFTER the final
+          :meth:`authorize_route` admission but BEFORE the upstream connection
+          is established.  Rewriting ``request.host`` / ``request.port`` here
+          invalidates the prior admission; the core re-runs
+          :meth:`authorize_route` for the new destination and only connects if
+          it is admitted.
+        - On pipelined requests the upstream connection already exists and is
+          pinned to a specific host:port.  Changing the destination here (or in
+          any later hook) is rejected with
+          :class:`~proxy.http.exception.RouteAuthorizationRejected` instead of
+          sending traffic for a different destination over the admitted
+          connection.
+        - Returning None is the supported short-circuit (e.g. cache hit): no
+          request reaches the upstream and no further routing checks are needed
+          because admission already succeeded for this destination.
         """
         return request  # pragma: no cover
 

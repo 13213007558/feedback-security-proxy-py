@@ -50,9 +50,7 @@ class FilterByURLRegexPlugin(HttpProxyBasePlugin):
             with open(self.flags.filtered_url_regex_config, 'rb') as f:
                 self.filters = json.load(f)
 
-    def handle_client_request(
-            self, request: HttpParser,
-    ) -> Optional[HttpParser]:
+    def _reject_if_blocked(self, request: HttpParser) -> None:
         # determine host
         request_host = None
         if request.host:
@@ -62,7 +60,7 @@ class FilterByURLRegexPlugin(HttpProxyBasePlugin):
 
         if not request_host:
             logger.error("Cannot determine host")
-            return request
+            return
 
         # build URL
         url = b'%s%s' % (
@@ -87,4 +85,19 @@ class FilterByURLRegexPlugin(HttpProxyBasePlugin):
                     status_code=httpStatusCodes.NOT_FOUND,
                     reason=b'Blocked',
                 )
+
+    def authorize_route(
+            self, request: HttpParser,
+    ) -> Optional[bool]:
+        # Authoritative check for the final destination.  Runs even when another
+        # plugin rewrites the route after this plugin was originally ordered.
+        self._reject_if_blocked(request)
+        return True
+
+    def handle_client_request(
+            self, request: HttpParser,
+    ) -> Optional[HttpParser]:
+        # Kept for backward compatibility.  The same policy is enforced from
+        # authorize_route against the final, actually connected destination.
+        self._reject_if_blocked(request)
         return request

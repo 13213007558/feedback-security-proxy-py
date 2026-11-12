@@ -12,11 +12,13 @@ from .base import HttpProtocolException
 from .proxy_auth_failed import ProxyAuthenticationFailed
 from .proxy_conn_failed import ProxyConnectionFailed
 from .http_request_rejected import HttpRequestRejected
+from .route_authorization_rejected import RouteAuthorizationRejected
 
 
 __all__ = [
     'HttpProtocolException',
     'HttpRequestRejected',
+    'RouteAuthorizationRejected',
     'ProxyAuthenticationFailed',
     'ProxyConnectionFailed',
 ]

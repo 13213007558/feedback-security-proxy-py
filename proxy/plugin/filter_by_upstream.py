@@ -29,12 +29,28 @@ flags.add_argument(
 class FilterByUpstreamHostPlugin(HttpProxyBasePlugin):
     """Drop traffic by inspecting upstream host."""
 
+    def _is_filtered(self, request: HttpParser) -> bool:
+        return text_(request.host) in self.flags.filtered_upstream_hosts.split(',')
+
     def before_upstream_connection(
             self, request: HttpParser,
     ) -> Optional[HttpParser]:
-        if text_(request.host) in self.flags.filtered_upstream_hosts.split(','):
+        # Kept for backward compatibility.  The authoritative check lives in
+        # authorize_route so it is evaluated against the final, actually
+        # connected destination regardless of plugin ordering.
+        if self._is_filtered(request):
             raise HttpRequestRejected(
                 status_code=httpStatusCodes.I_AM_A_TEAPOT,
                 reason=b'I\'m a tea pot',
             )
         return request
+
+    def authorize_route(
+            self, request: HttpParser,
+    ) -> Optional[bool]:
+        if self._is_filtered(request):
+            raise HttpRequestRejected(
+                status_code=httpStatusCodes.I_AM_A_TEAPOT,
+                reason=b'I\'m a tea pot',
+            )
+        return True

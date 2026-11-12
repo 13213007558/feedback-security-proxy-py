@@ -21,14 +21,16 @@ import socket
 import logging
 import threading
 import subprocess
-from typing import Any, Dict, List, Union, Optional
+from typing import Any, Dict, List, Tuple, Union, Optional
 
 from .plugin import HttpProxyBasePlugin
 from ..parser import HttpParser, httpParserTypes, httpParserStates
 from ..plugin import HttpProtocolHandlerPlugin
 from ..headers import httpHeaders
 from ..methods import httpMethods
-from ..exception import HttpProtocolException, ProxyConnectionFailed
+from ..exception import (
+    HttpProtocolException, ProxyConnectionFailed, RouteAuthorizationRejected,
+)
 from ..protocols import httpProtocols
 from ..responses import PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT
 from ...common.pki import gen_csr, sign_csr, gen_public_key
@@ -140,6 +142,10 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
         self.response: HttpParser = HttpParser(httpParserTypes.RESPONSE_PARSER)
         self.pipeline_request: Optional[HttpParser] = None
         self.pipeline_response: Optional[HttpParser] = None
+        # host:port admitted by the final authorize_route phase.
+        # Set only once a route has been admitted and, when applicable,
+        # an upstream connection to that exact destination exists.
+        self.authorized_route: Optional[Tuple[bytes, int]] = None
 
         self.plugins: Dict[str, HttpProxyBasePlugin] = {}
         if b'HttpProxyBasePlugin' in self.flags.plugins:
@@ -456,6 +462,13 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
                             return
                         self.pipeline_request = r
                     assert self.pipeline_request is not None
+                    # The upstream connection is already pinned to the admitted
+                    # destination.  Reject a pipelined request that points at a
+                    # different host:port, otherwise run the final admission
+                    # phase against the exact destination in this request.
+                    route = self._pinned_route(self.pipeline_request)
+                    self._ensure_route_admitted(self.pipeline_request, route)
+                    self._authorize_route(self.pipeline_request, route)
                     # TODO(abhinavsingh): Remove memoryview wrapping here after
                     # parser is fully memoryview compliant
                     self.upstream.queue(
@@ -486,6 +499,8 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
 
     def on_request_complete(self) -> Union[socket.socket, bool]:
         self.emit_request_complete()
+        # Baseline destination before any plugin gets a chance to rewrite it.
+        self.authorized_route = self._route(self.request)
 
         # Invoke plugin.before_upstream_connection
         #
@@ -494,6 +509,9 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
         # 2) return None to continue without establishing an upstream server connection
         #    e.g. for scenarios when plugins want to return response from cache, or,
         #    via out-of-band over the network request.
+        # 3) Rewrite the request destination (host/port).  The final route
+        #    admission below is always evaluated against the resulting
+        #    destination, so authorization cannot depend on plugin ordering.
         do_connect = True
         for plugin in self.plugins.values():
             r = plugin.before_upstream_connection(self.request)
@@ -502,18 +520,34 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
                 break
             self.request = r
 
-        # Connect to upstream
-        if do_connect:
-            self.connect_upstream()
+        # Final route admission.  Runs after every before_upstream_connection
+        # plugin has seen (and possibly rewritten) the request, but before any
+        # upstream socket is opened and before handle_client_request can emit
+        # any response.  Both plain HTTP and CONNECT requests pass through this
+        # phase, so a rejection never establishes a connection nor leaks a
+        # response, regardless of plugin ordering.
+        self._authorize_route(self.request)
 
-        # Invoke plugin.handle_client_request
+        # Invoke plugin.handle_client_request.  On the first request no upstream
+        # socket exists yet, hence plugins may still rewrite the destination here.
+        # Every returned request is checked: if the destination changed, the
+        # route is admitted again before a connection can be opened.
         for plugin in self.plugins.values():
             assert self.request is not None
             r = plugin.handle_client_request(self.request)
             if r is not None:
+                self._ensure_route_admitted(r)
                 self.request = r
             else:
+                # Plugin short-circuited the request (e.g. cache hit or a
+                # directly queued response).  Admission already succeeded above
+                # for this exact destination, so no upstream connection is made.
                 return False
+
+        # Connect to upstream only once the final (host, port) was admitted.
+        if do_connect:
+            self.connect_upstream()
+        self.authorized_route = self._route(self.request)
 
         # For https requests, respond back with tunnel established response.
         # Optionally, setup interceptor if TLS interception is enabled.
@@ -553,6 +587,79 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
                     ),
                 )
         return False
+
+    @staticmethod
+    def _route(request: HttpParser) -> Tuple[bytes, int]:
+        """Returns the (host, port) the request will actually connect to."""
+        if not request.host or not request.port:
+            raise HttpProtocolException('Both host and port must exist')
+        return request.host, request.port
+
+    def _pinned_route(self, request: HttpParser) -> Tuple[bytes, int]:
+        """Route to admit for a request on an already established connection.
+
+        TLS-intercepted requests inside a CONNECT tunnel use origin-form
+        request lines (path only, no host/port); the actual destination is the
+        tunnel endpoint admitted when the connection was opened.  Fall back to
+        that pinned route when the request does not carry its own host/port.
+        """
+        if request.host and request.port:
+            return request.host, request.port
+        if self.authorized_route is not None:
+            return self.authorized_route
+        return self._route(request)
+
+    def _authorize_route(
+            self,
+            request: HttpParser,
+            route: Optional[Tuple[bytes, int]] = None,
+    ) -> None:
+        """Runs the final route admission phase across all plugins.
+
+        Every plugin gets to vote on the exact (host, port) encoded in the
+        request.  A single rejection (returning False or raising
+        HttpRequestRejected / RouteAuthorizationRejected) denies the route.
+        This is invoked before an upstream connection is established, so a
+        rejection never results in a connection to the denied destination.
+        """
+        route = route or self._route(request)
+        for plugin in self.plugins.values():
+            decision = plugin.authorize_route(request)
+            if decision is False:
+                raise RouteAuthorizationRejected(
+                    host=route[0],
+                    port=route[1],
+                )
+        self.authorized_route = route
+
+    def _ensure_route_admitted(
+            self,
+            request: HttpParser,
+            route: Optional[Tuple[bytes, int]] = None,
+    ) -> None:
+        """Re-validates admission when a plugin may have rewritten the route.
+
+        On the first request no connection exists yet, hence a changed
+        destination is simply re-admitted.  Once an upstream connection is
+        pinned to a destination, changing it is rejected outright because the
+        open connection cannot carry traffic for a different host:port.
+        """
+        route = route or self._route(request)
+        if route == self.authorized_route:
+            return
+        if self.upstream is not None and not self.upstream.closed:
+            raise RouteAuthorizationRejected(
+                host=route[0],
+                port=route[1],
+                reason=(
+                    b'Destination changed after route admission: '
+                    b'%b -> %b' % (
+                        (self.authorized_route or (b'?', 0))[0],
+                        route[0],
+                    )
+                ),
+            )
+        self._authorize_route(request, route)
 
     def handle_pipeline_response(self, raw: memoryview) -> None:
         if self.pipeline_response is None:

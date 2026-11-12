@@ -1142,6 +1142,56 @@ If we enable `RedirectToCustomServerPlugin` before `FilterByUpstreamHostPlugin`,
 `facebook` requests will also get redirected to inbuilt web server,
 instead of being dropped.
 
+### Routing security and plugin ordering
+
+Authorization must always be evaluated against the destination the proxy
+actually connects to, never against an earlier value that another plugin
+rewrites away.  To make this independent of plugin ordering, proxy.py runs an
+explicit **final route admission** phase on every request, including plain
+HTTP proxy requests and `CONNECT` (HTTPS tunnel) requests.
+
+Implement destination based allow/deny policies in
+`HttpProxyBasePlugin.authorize_route` instead of (or in addition to)
+`before_upstream_connection`.  The core invokes `authorize_route` on every
+plugin after all request rewriting has settled, but **before** any upstream
+socket is opened.  A single plugin rejecting the route (returning `False` or
+raising `HttpRequestRejected`) denies it and no connection to the denied
+host:port is established.
+
+The request lifecycle and its routing guarantees are:
+
+1. `before_upstream_connection`: runs first, with no upstream connection yet.
+   Plugins may reject the request or rewrite its destination here.  Returning
+   `None` opts out of establishing an upstream connection (e.g. cache or
+   short-link style plugins).
+2. `authorize_route`: the final admission decision for the exact `host:port`
+   the proxy is about to connect to.  Runs before the connection is opened, so
+   rejection never reaches the network.
+3. `handle_client_request`: runs after admission but before connect on the
+   first request.  If a plugin changes the destination here, the core
+   re-runs `authorize_route` for the new destination before connecting.
+   Returning `None` is the supported short-circuit (e.g. serving a cached
+   response); admission has already succeeded for that destination.
+4. On pipelined requests the upstream connection is already pinned to an
+   admitted host:port.  Changing the destination at this point is rejected
+   with `RouteAuthorizationRejected` instead of sending traffic for a
+   different destination over the admitted connection.  TLS-intercepted
+   requests inside a `CONNECT` tunnel (origin-form, no host/port) are admitted
+   against the already connected tunnel endpoint.
+
+Ordering rules that affect routing security:
+
+- Place destination rewriting plugins wherever convenient; admission is always
+  re-evaluated against the rewritten destination, so a rewrite can no longer
+  bypass a policy plugin that ran earlier.
+- Do not rely solely on `before_upstream_connection` for policy: a later plugin
+  can still change the route.  Built-in filters
+  (`FilterByUpstreamHostPlugin`, `FilterByURLRegexPlugin`) keep their legacy
+  hooks for compatibility but enforce the same policy from `authorize_route`.
+- A plugin that answers directly without an upstream connection (returns
+  `None` from `before_upstream_connection`) owns the client exchange and must
+  not open its own connection to a destination `authorize_route` would deny.
+
 # End-to-End Encryption
 
 By default, `proxy.py` uses `http` protocol for communication with clients e.g. `curl`, `browser`. For enabling end-to-end encrypting using `tls` / `https` first generate certificates. **Checkout** the repository and run:
