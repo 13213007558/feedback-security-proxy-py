@@ -161,6 +161,17 @@ class ProxyPoolPlugin(TcpUpstreamConnectionHandler, HttpProxyBasePlugin):
             host, port, path, request.method,
         ]
         # Queue original request optionally with auth headers to upstream proxy
+        #
+        # Proxy-Authorization submitted by the client is meant for
+        # proxy.py itself and must not be forwarded to upstream proxies.
+        # Upstream proxy credentials, when necessary, are sourced from
+        # the configured endpoint URL, never from the client request.
+        request.del_headers(
+            [
+                httpHeaders.PROXY_AUTHORIZATION,
+                httpHeaders.PROXY_CONNECTION,
+            ],
+        )
         if self._endpoint.has_credentials:
             assert self._endpoint.username and self._endpoint.password
             request.add_header(

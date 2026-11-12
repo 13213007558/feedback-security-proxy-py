@@ -456,11 +456,14 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
                             return
                         self.pipeline_request = r
                     assert self.pipeline_request is not None
+                    self._del_hop_by_hop_headers(self.pipeline_request)
                     # TODO(abhinavsingh): Remove memoryview wrapping here after
                     # parser is fully memoryview compliant
                     self.upstream.queue(
                         memoryview(
-                            self.pipeline_request.build(),
+                            self.pipeline_request.build(
+                                disable_headers=self.flags.disable_headers,
+                            ),
                         ),
                     )
                     if not self.pipeline_request.is_connection_upgrade:
@@ -525,15 +528,7 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
             # If an upstream server connection was established for http request,
             # queue the request for upstream server.
             else:
-                # - proxy-connection header is a mistake, it doesn't seem to be
-                #   officially documented in any specification, drop it.
-                # - proxy-authorization is of no use for upstream, remove it.
-                self.request.del_headers(
-                    [
-                        httpHeaders.PROXY_AUTHORIZATION,
-                        httpHeaders.PROXY_CONNECTION,
-                    ],
-                )
+                self._del_hop_by_hop_headers(self.request)
                 # - For HTTP/1.0, connection header defaults to close
                 # - For HTTP/1.1, connection header defaults to keep-alive
                 # Respect headers sent by client instead of manipulating
@@ -962,6 +957,33 @@ class HttpProxyPlugin(HttpProtocolHandlerPlugin):
     #
     # Internal methods
     #
+
+    @staticmethod
+    def _del_hop_by_hop_headers(request: HttpParser) -> None:
+        """Removes hop-by-hop headers which must never be dispatched
+        to the upstream origin server."""
+        # - proxy-connection header is a mistake, it doesn't seem to be
+        #   officially documented in any specification, drop it.
+        # - proxy-authorization is of no use for upstream, remove it.
+        request.del_headers(
+            [
+                httpHeaders.PROXY_AUTHORIZATION,
+                httpHeaders.PROXY_CONNECTION,
+            ],
+        )
+        # Connection upgrade requests (e.g. websocket) intentionally
+        # forward Connection & Upgrade headers to the upstream server.
+        if request.is_connection_upgrade:
+            return
+        # Also drop any additional hop-by-hop headers nominated by the
+        # client within the Connection header.
+        # Ref: https://datatracker.ietf.org/doc/html/rfc7230#section-6.1
+        if request.has_header(b'connection'):
+            request.del_headers([
+                token.strip()
+                for token in request.header(b'connection').split(COMMA)
+                if token.strip() != b''
+            ])
 
     def _close_and_release(self) -> bool:
         if self.flags.enable_conn_pool:
